@@ -1,6 +1,7 @@
 from telebot import TeleBot, types
 import sqlite3
 import random
+import time
 
 bot = TeleBot("7505424553:AAH-gnl9ZaxiISnOE2OukqAKePcWWy4GZL8")
 conn = sqlite3.connect("users.db", check_same_thread=False)
@@ -42,14 +43,263 @@ conn.commit()
 state = {}
 BATTLE_STATES = {}
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS deaths (
+    user_id INTEGER PRIMARY KEY,
+    death_time INTEGER
+)""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS loot (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_name TEXT,
+    min_level INTEGER,
+    chance REAL
+)""")
+
+
+loot_items = [
+    ("Золотая монета", 1, 0.7),
+    ("Редкий меч", 3, 0.3),
+    ("Щит героя", 5, 0.2),
+    ("Кольцо удачи", 2, 0.4),
+    ("Зелье удачи", 1, 0.45),  # Добавлено
+    ("Эликсир здоровья", 1, 0.5)
+]
+for item in loot_items:
+    cursor.execute("INSERT OR IGNORE INTO loot (item_name, min_level, chance) VALUES (?, ?, ?)", item)
+conn.commit()
+
+def get_enemy(level):
+    base_hp = 50 + (level-1)*20
+    base_attack = 10 + (level-1)*3
+    enemies = [
+        {"name": "Гоблин", "hp": base_hp, "attack": base_attack},
+        {"name": "Тролль", "hp": base_hp*1.5, "attack": base_attack*1.2},
+        {"name": "Дракон", "hp": base_hp*3, "attack": base_attack*2}
+    ]
+    return random.choice(enemies[:min(level//3 + 1, 3)])
+
+def calculate_escape_chance(user_id):
+    cursor.execute("SELECT * FROM inventory WHERE user_id = ? AND item_name = 'Зелье удачи'", (user_id,))
+    has_luck_potion = cursor.fetchone() is not None
+    return 45 if has_luck_potion else 70
+
+def get_revive_options(user_id):
+    markup = types.InlineKeyboardMarkup()
+    cursor.execute("SELECT death_time FROM deaths WHERE user_id = ?", (user_id,))
+    death_time = cursor.fetchone()
+    if death_time and (time.time() - death_time[0]) >= 300:  
+        markup.add(types.InlineKeyboardButton("Возродиться бесплатно", callback_data="revive_free"))
+    else:
+        markup.add(types.InlineKeyboardButton("Подождать 5 минут", callback_data="revive_wait"))  
+    
+    markup.add(types.InlineKeyboardButton("Поспать (-15% HP)", callback_data="revive_sleep"))  
+    return markup
+
+
+def give_loot(user_id, level):
+    cursor.execute("SELECT * FROM loot WHERE min_level <= ?", (level,))
+    possible_loot = cursor.fetchall()
+    total_chance = sum(item[3] for item in possible_loot)
+    rand = random.uniform(0, total_chance)
+    current = 0
+    for item in possible_loot:
+        current += item[3]
+        if rand <= current:
+            cursor.execute("INSERT INTO inventory (user_id, item_name) VALUES (?, ?)", (user_id, item[1]))
+            conn.commit()
+            return item[1]
+    return None
+
+@bot.callback_query_handler(lambda call: call.data.startswith("battle_"))
+def handle_battle_actions(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    battle = BATTLE_STATES.get(user_id)
+    if not battle:
+        bot.answer_callback_query(call.id, "Бой завершен!")
+        return
+
+    user = get_user(user_id)
+    enemy = battle['enemy']
+    
+    if call.data == "battle_attack":
+        
+        player_damage = user[7] + random.randint(1, 5)
+        battle['enemy_hp'] -= player_damage
+        
+        
+        enemy_damage = enemy['attack'] + random.randint(1, 3) - user[10]//2
+        battle['user_hp'] -= max(enemy_damage, 0)
+        
+        
+        if battle['enemy_hp'] <= 0:
+            exp_gain = random.choices(
+            [50, 100, 150],
+            weights=[50, 40, 10]
+        )[0]
+            # Победа
+            exp_gain = enemy['attack'] * 10
+            gold_gain = random.randint(10, 50)
+            loot = give_loot(user_id, user[13])
+            
+            # Обновляем опыт и золото
+            cursor.execute("UPDATE users SET exp = exp + ?, gold = gold + ? WHERE user_id = ?",
+                        (exp_gain, gold_gain, user_id))
+            conn.commit()
+            
+            # Проверка повышения уровня
+            new_level = check_level_up(user_id)
+            level_up_msg = f"\n🎉 Поздравляем! Вы достигли уровня {new_level}!" if new_level else ""
+            
+            msg = (f"🏆 Победа!\n"
+                f"Получено: {exp_gain} опыта и {gold_gain} золота\n"
+                f"Добыча: {loot if loot else 'нет'}"
+                f"{level_up_msg}")
+            bot.edit_message_text(msg, call.message.chat.id, call.message.message_id)
+            del BATTLE_STATES[user_id]
+            return
+            
+        elif battle['user_hp'] <= 0:
+            
+            cursor.execute("INSERT OR REPLACE INTO deaths (user_id, death_time) VALUES (?, ?)",
+                         (user_id, int(time.time())))
+            conn.commit()
+            
+            markup = get_revive_options(user_id)
+            bot.edit_message_text("☠️ Вы пали в бою!", call.message.chat.id, call.message.message_id, reply_markup=markup)
+            del BATTLE_STATES[user_id]
+            return
+            
+        show_battle_interface(call.message, user_id)
+    
+    elif call.data == "battle_flee":
+        escape_chance = calculate_escape_chance(user_id)
+        if random.randint(1, 100) <= escape_chance:
+            bot.edit_message_text("🏃♂️ Вы успешно сбежали!", call.message.chat.id, call.message.message_id)
+            del BATTLE_STATES[user_id]
+        else:
+            enemy_damage = enemy['attack'] + random.randint(1, 3)
+            battle['user_hp'] -= enemy_damage
+            bot.answer_callback_query(call.id, f"Не удалось сбежать! Получено урона: {enemy_damage}")
+            show_battle_interface(call.message, user_id)
+
+@bot.callback_query_handler(lambda call: call.data.startswith("revive_"))
+def handle_revive(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    user = get_user(user_id)
+    msg = "Действие выполнено"  # Значение по умолчанию
+    
+    try:
+        if call.data == "revive_sleep":
+            cursor.execute("SELECT death_time FROM deaths WHERE user_id = ?", (user_id,))
+            death_time = cursor.fetchone()[0]
+            time_diff = time.time() - death_time
+            
+            if time_diff < 300:  # 5 минут
+                new_hp = int(user[10] * 0.85)
+                cursor.execute("UPDATE users SET stamina = ? WHERE user_id = ?", (new_hp//10, user_id))
+                msg = f"💤 Вы поспали и потеряли 15% HP! Текущее HP: {new_hp}"
+            else:
+                msg = "💤 Вы полноценно отдохнули и не потеряли HP!"
+            
+            cursor.execute("DELETE FROM deaths WHERE user_id = ?", (user_id,))
+            conn.commit()
+
+        elif call.data == "revive_potion":
+            # Логика для возрождения зельем
+            cursor.execute("DELETE FROM deaths WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM inventory WHERE user_id = ? AND item_name = 'Зелье воскрешения'", (user_id,))
+            conn.commit()
+            msg = "⚗️ Вы использовали зелье воскрешения!"
+            
+        elif call.data == "revive_free":
+            cursor.execute("DELETE FROM deaths WHERE user_id = ?", (user_id,))
+            conn.commit()
+            msg = "🆓 Бесплатное возрождение!"
+            
+        elif call.data == "revive_wait":
+            msg = "⏳ Вам нужно подождать 5 минут для бесплатного возрождения"
+            
+        bot.edit_message_text(msg, call.message.chat.id, call.message.message_id)
+        
+    except Exception as e:
+        print(f"Ошибка в handle_revive: {str(e)}")
+        bot.answer_callback_query(call.id, "Произошла ошибка при обработке запроса")
+
+    # Обновляем главное меню
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Профиль", callback_data="Профиль"),
+               types.InlineKeyboardButton("Магазин", callback_data="Магазин"),
+               types.InlineKeyboardButton("Бой", callback_data="start_battle"))
+    bot.send_message(call.message.chat.id, "🏠 Главное меню", reply_markup=markup)
+
+
+
+def check_level_up(user_id):
+    user = get_user(user_id)
+    current_exp = user[14]
+    exp_needed = user[15]
+    
+    if current_exp >= exp_needed:
+        new_level = user[13] + 1
+        new_exp = current_exp - exp_needed
+        new_exp_needed = get_exp_to_next_level(new_level)
+        
+        # Повышаем характеристики
+        update_query = """
+            UPDATE users SET 
+            level = ?,
+            exp = ?,
+            exp_to_next_level = ?,
+            strength = strength + 1,
+            agility = agility + 1,
+            intellect = intellect + 1,
+            stamina = stamina + 1 
+            WHERE user_id = ?
+        """
+        cursor.execute(update_query, (new_level, new_exp, new_exp_needed, user_id))
+        conn.commit()
+        
+        return new_level
+    return None
+
+
+def show_battle_interface(message, user_id):
+    battle = BATTLE_STATES[user_id]
+    enemy = battle["enemy"]
+    user = get_user(user_id)
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("Атаковать", callback_data="battle_attack"),
+               types.InlineKeyboardButton(f"Сбежать ({calculate_escape_chance(user_id)}%)", callback_data="battle_flee"))
+    
+    inventory = get_user_inventory(user_id)
+    for item in inventory:
+        if "Зелье" in item[2]:
+            markup.add(types.InlineKeyboardButton(f"Использовать {item[2]}", callback_data=f"use_{item[0]}"))
+    
+    msg_text = (f"⚔️ Бой с {enemy['name']} (Ур. {user[13]})\n"
+               f"❤️ Ваше здоровье: {battle['user_hp']}\n"
+               f"💀 Здоровье врага: {battle['enemy_hp']}")
+    bot.edit_message_text(msg_text, message.chat.id, message.message_id, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "start_battle")
+def start_battle(call: types.CallbackQuery):
+    user = get_user(call.from_user.id)
+    enemy = get_enemy(user[13])
+    BATTLE_STATES[call.from_user.id] = {
+        "enemy": enemy,
+        "user_hp": user[10] * 10,
+        "enemy_hp": enemy["hp"],
+        "temp_buffs": {}
+    }
+    show_battle_interface(call.message, call.from_user.id)
+
+
 def get_exp_to_next_level(current_level):
-    if current_level < 10:
-        return 500
-    elif current_level < 15:
-        return 1000
-    elif current_level < 30:
-        return 5000
-    return 10000
+    return 500 * (2 ** (current_level // 5))
 
 def get_user(user_id):
     cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
